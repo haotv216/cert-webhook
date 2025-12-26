@@ -1,18 +1,21 @@
 import os
 import uuid
 import logging
-import threading
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, HttpUrl, Field
 
 # Load environment variables from .env file
 load_dotenv()
 
-app = Flask(__name__)
+app = FastAPI(title="Cert Webhook API", version="1.0.0")
 
 # Configure logging
 logging.basicConfig(
@@ -31,10 +34,25 @@ WEBHOOK_RETRY_DELAY = int(os.getenv("WEBHOOK_RETRY_DELAY", "5"))
 # Storage for tracking requests
 request_tracking: Dict[str, Dict[str, Any]] = {}
 
+# Thread pool executor for blocking I/O operations
+executor = ThreadPoolExecutor(max_workers=10)
 
-def _error(message: str, status: int = 400):
-    """Return a JSON error response."""
-    return jsonify({"status": "error", "message": message}), status
+
+# Pydantic models for request validation
+class CertAddRequest(BaseModel):
+    callback_url: HttpUrl
+    cname_id: str
+    domain: str
+    email: str
+    user_id: str
+
+
+class CertRejectRequest(BaseModel):
+    callback_url: HttpUrl
+    cname_id: str
+    domain: str
+    email: str
+    user_id: str
 
 
 def _send_webhook(callback_url: str, payload: Dict[str, Any], retry_count: int = 0) -> bool:
@@ -45,7 +63,7 @@ def _send_webhook(callback_url: str, payload: Dict[str, Any], retry_count: int =
     try:
         logger.info(f"Sending webhook to {callback_url}, attempt {retry_count + 1}")
         response = requests.post(
-            callback_url,
+            str(callback_url),
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=WEBHOOK_TIMEOUT,
@@ -141,7 +159,7 @@ def _process_cert_request(request_id: str, request_data: Dict[str, Any], callbac
         "status": "processing",
         "requested_at": datetime.now(timezone.utc).isoformat() + "Z",
         "domain": request_data.get("domain"),
-        "callback_url": callback_url,
+        "callback_url": str(callback_url),
     }
     
     # Call external cert API
@@ -161,7 +179,7 @@ def _process_cert_request(request_id: str, request_data: Dict[str, Any], callbac
         
         request_tracking[request_id]["status"] = "failed"
         request_tracking[request_id]["error"] = error_info or "API call failed"
-        _send_webhook(callback_url, error_payload)
+        _send_webhook(str(callback_url), error_payload)
         return
     
     # API call succeeded, send result to callback_url
@@ -178,94 +196,54 @@ def _process_cert_request(request_id: str, request_data: Dict[str, Any], callbac
     request_tracking[request_id]["result"] = api_result
     
     # Send webhook to callback_url
-    webhook_sent = _send_webhook(callback_url, webhook_payload)
+    webhook_sent = _send_webhook(str(callback_url), webhook_payload)
     if not webhook_sent:
         request_tracking[request_id]["webhook_status"] = "failed"
     else:
         request_tracking[request_id]["webhook_status"] = "sent"
 
 
-@app.route("/api/v1.0/cert/add", methods=["POST"])
-def cert_add():
+@app.post("/api/v1.0/cert/add", status_code=202)
+async def cert_add(request: CertAddRequest, background_tasks: BackgroundTasks):
     """
     Webhook SENDER endpoint.
     Receives request from system, calls external cert API, and sends result to callback_url.
     """
-    payload = request.get_json(silent=True)
-    if not payload:
-        return _error("Missing JSON body")
-    
-    # Validate required fields
-    required_fields = ["callback_url", "cname_id", "domain", "email", "user_id"]
-    for field in required_fields:
-        if field not in payload:
-            return _error(f"Missing required field: {field}")
-    
-    callback_url = payload.get("callback_url")
-    if not callback_url or not isinstance(callback_url, str):
-        return _error("Invalid callback_url")
-    
     # Generate request ID
     request_id = str(uuid.uuid4())
     
     # Prepare request data for external API (remove callback_url as it's for our webhook)
     request_data = {
-        "cname_id": payload.get("cname_id"),
-        "domain": payload.get("domain"),
-        "email": payload.get("email"),
-        "user_id": payload.get("user_id"),
+        "cname_id": request.cname_id,
+        "domain": request.domain,
+        "email": request.email,
+        "user_id": request.user_id,
     }
     
-    # Start background processing
-    thread = threading.Thread(
-        target=_process_cert_request,
-        args=(request_id, request_data, callback_url),
-        daemon=True
+    # Add background task
+    background_tasks.add_task(
+        _process_cert_request,
+        request_id,
+        request_data,
+        request.callback_url
     )
-    thread.start()
     
-    logger.info(f"Cert request {request_id} queued for processing, callback_url: {callback_url}")
+    logger.info(f"Cert request {request_id} queued for processing, callback_url: {request.callback_url}")
     
     # Return immediate response
-    return jsonify({
+    return {
         "status": "accepted",
         "request_id": request_id,
         "message": "Request received and processing started",
-        "domain": payload.get("domain"),
-    }), 202
-
-
-@app.route("/api/v1.0/cert/reject", methods=["POST"])
-def cert_reject():
-    """
-    Webhook SENDER endpoint for rejecting cert.
-    Calls external reject API and sends result to callback_url.
-    """
-    payload = request.get_json(silent=True)
-    if not payload:
-        return _error("Missing JSON body")
-    
-    # Validate required fields
-    required_fields = ["callback_url", "cname_id", "domain", "email", "user_id"]
-    for field in required_fields:
-        if field not in payload:
-            return _error(f"Missing required field: {field}")
-    
-    callback_url = payload.get("callback_url")
-    if not callback_url or not isinstance(callback_url, str):
-        return _error("Invalid callback_url")
-    
-    request_id = str(uuid.uuid4())
-    
-    # Prepare request data for external API
-    request_data = {
-        "cname_id": payload.get("cname_id"),
-        "domain": payload.get("domain"),
-        "email": payload.get("email"),
-        "user_id": payload.get("user_id"),
+        "domain": request.domain,
     }
-    
-    # Call external reject API
+
+
+def _call_reject_api(request_data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Call the external reject API and return the response.
+    Returns: (result, error_info) where error_info is None if successful.
+    """
     api_url = f"{CERT_API_BASE_URL}/api/v1.0/cert/reject"
     
     try:
@@ -283,56 +261,95 @@ def cert_reject():
         )
         response.raise_for_status()
         api_result = response.json()
-        
-        # Send result to callback_url
-        webhook_payload = {
-            "status": "success",
-            "request_id": request_id,
-            "action": "reject",
-            "domain": payload.get("domain"),
-            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
-            "result": api_result,
-        }
-        
-        _send_webhook(callback_url, webhook_payload)
-        
-        return jsonify({
-            "status": "success",
-            "request_id": request_id,
-            "message": "Reject request processed and webhook sent",
-        }), 200
+        return api_result, None
         
     except requests.exceptions.RequestException as e:
+        error_info = {
+            "error_type": "request_error",
+            "message": str(e),
+            "api_url": api_url,
+        }
         logger.error(f"Reject API error: {str(e)}")
-        
-        # Send error to callback_url
+        return None, error_info
+
+
+@app.post("/api/v1.0/cert/reject")
+async def cert_reject(request: CertRejectRequest, background_tasks: BackgroundTasks):
+    """
+    Webhook SENDER endpoint for rejecting cert.
+    Calls external reject API and sends result to callback_url.
+    """
+    request_id = str(uuid.uuid4())
+    
+    # Prepare request data for external API
+    request_data = {
+        "cname_id": request.cname_id,
+        "domain": request.domain,
+        "email": request.email,
+        "user_id": request.user_id,
+    }
+    
+    # Call external reject API in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    api_result, error_info = await loop.run_in_executor(
+        executor,
+        _call_reject_api,
+        request_data
+    )
+    
+    if api_result is None:
+        # API call failed
         error_payload = {
             "status": "error",
             "request_id": request_id,
             "action": "reject",
-            "message": f"Failed to process reject request: {str(e)}",
-            "domain": payload.get("domain"),
+            "message": f"Failed to process reject request: {error_info.get('message', 'Unknown error') if error_info else 'Unknown error'}",
+            "domain": request.domain,
             "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
         }
-        _send_webhook(callback_url, error_payload)
+        if error_info:
+            error_payload["error_details"] = error_info
         
-        return _error(f"Failed to process reject request: {str(e)}", 500)
+        background_tasks.add_task(_send_webhook, str(request.callback_url), error_payload)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process reject request: {error_info.get('message', 'Unknown error') if error_info else 'Unknown error'}"
+        )
+    
+    # API call succeeded, send result to callback_url in background
+    webhook_payload = {
+        "status": "success",
+        "request_id": request_id,
+        "action": "reject",
+        "domain": request.domain,
+        "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
+        "result": api_result,
+    }
+    
+    background_tasks.add_task(_send_webhook, str(request.callback_url), webhook_payload)
+    
+    return {
+        "status": "success",
+        "request_id": request_id,
+        "message": "Reject request processed and webhook sent",
+    }
 
 
-@app.route("/status/<request_id>", methods=["GET"])
-def get_status(request_id):
+@app.get("/status/{request_id}")
+async def get_status(request_id: str):
     """Get status of a cert request."""
     if request_id not in request_tracking:
-        return _error("Request not found", 404)
-    return jsonify(request_tracking[request_id]), 200
+        raise HTTPException(status_code=404, detail="Request not found")
+    return request_tracking[request_id]
 
 
-@app.route("/health", methods=["GET"])
-def health():
+@app.get("/health")
+async def health():
     """Health check endpoint."""
-    return jsonify({"status": "healthy"}), 200
+    return {"status": "healthy"}
 
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
